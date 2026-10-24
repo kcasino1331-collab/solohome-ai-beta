@@ -107,6 +107,178 @@ const dialog = document.querySelector("#app-dialog");
 const dialogContent = document.querySelector("#dialog-content");
 const toast = document.querySelector("#toast");
 let toastTimer;
+const backendConfig = window.SOLOHOME_BACKEND || {};
+let betaSession = null;
+let pendingBetaEmail = "";
+let liveRequests = [];
+let liveRequestsLoaded = false;
+let liveRequestsLoading = false;
+let liveRequestsError = "";
+
+function backendConfigured() {
+  return Boolean(backendConfig.supabaseUrl?.trim() && backendConfig.supabaseAnonKey?.trim());
+}
+
+function backendUrl(path) {
+  return `${backendConfig.supabaseUrl.replace(/\/+$/, "")}/${path}`;
+}
+
+async function supabaseRequest(path, { method = "GET", body, token } = {}) {
+  const response = await fetch(backendUrl(path), {
+    method,
+    headers: {
+      apikey: backendConfig.supabaseAnonKey,
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(method === "POST" && path.startsWith("rest/") ? { Prefer: "return=representation" } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const raw = await response.text();
+  let result = null;
+  if (raw) {
+    try {
+      result = JSON.parse(raw);
+    } catch (error) {
+      console.error("The beta service returned an unreadable response.", error);
+      throw new Error("The beta service returned an unexpected response.");
+    }
+  }
+  if (!response.ok) {
+    const message = result?.msg || result?.message || result?.error_description || result?.error || "The beta service could not complete the request.";
+    throw new Error(message);
+  }
+  return result;
+}
+
+function saveBetaSession(session) {
+  betaSession = {
+    ...session,
+    expires_at: session.expires_at || Math.floor(Date.now() / 1000) + (session.expires_in || 3600),
+  };
+  sessionStorage.setItem("solohome-beta-session-v1", JSON.stringify(betaSession));
+}
+
+async function refreshBetaSession() {
+  if (!betaSession?.refresh_token) return null;
+  const refreshed = await supabaseRequest("auth/v1/token?grant_type=refresh_token", {
+    method: "POST",
+    body: { refresh_token: betaSession.refresh_token },
+  });
+  saveBetaSession(refreshed);
+  return betaSession;
+}
+
+async function getBetaAccessToken() {
+  if (!betaSession) return null;
+  if (betaSession.expires_at <= Math.floor(Date.now() / 1000) + 30) await refreshBetaSession();
+  return betaSession?.access_token || null;
+}
+
+async function initializeBetaAuth() {
+  if (!backendConfigured()) return;
+  try {
+    const stored = sessionStorage.getItem("solohome-beta-session-v1");
+    if (!stored) return;
+    betaSession = JSON.parse(stored);
+    if (!betaSession?.access_token || !betaSession?.refresh_token) throw new Error("Saved tester session is incomplete.");
+    const token = await getBetaAccessToken();
+    const user = await supabaseRequest("auth/v1/user", { token });
+    betaSession.user = user;
+    sessionStorage.setItem("solohome-beta-session-v1", JSON.stringify(betaSession));
+  } catch (error) {
+    console.error("Could not restore the invited tester session.", error);
+    betaSession = null;
+    sessionStorage.removeItem("solohome-beta-session-v1");
+    notify("Your tester session ended. Sign in again to see your saved requests.");
+  }
+  updateBetaAuthButton();
+  if (betaSession && state.page === "requests") await loadLiveRequests();
+}
+
+function updateBetaAuthButton() {
+  const button = document.querySelector("#beta-auth-button");
+  if (!button) return;
+  button.textContent = betaSession ? "Tester sign out" : "Tester sign in";
+  button.dataset.action = betaSession ? "beta-sign-out" : "beta-auth";
+}
+
+async function loadLiveRequests() {
+  if (!betaSession || !backendConfigured() || liveRequestsLoaded || liveRequestsLoading) return;
+  liveRequestsLoading = true;
+  try {
+    const token = await getBetaAccessToken();
+    const rows = await supabaseRequest("rest/v1/beta_requests?select=id,title,category,note,status,created_at&order=created_at.desc", { token });
+    liveRequests = rows.map((row) => ({
+      ...row,
+      isLive: true,
+      date: new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" }).format(new Date(row.created_at)),
+      manager: "Pilot team",
+    }));
+    liveRequestsError = "";
+  } catch (error) {
+    console.error("Could not load the invited tester's beta requests.", error);
+    liveRequestsError = error.message;
+  } finally {
+    liveRequestsLoading = false;
+  }
+  liveRequestsLoaded = true;
+  if (state.page === "requests") render();
+}
+
+function showBetaSignIn() {
+  if (!backendConfigured()) {
+    showDialog(`<div class="dialog-body"><p class="dialog-eyebrow">INVITED TESTER ACCESS</p><h2 class="dialog-title" id="dialog-title">Secure beta requests are not connected yet.</h2><p class="dialog-copy">I have prepared the sign-in and private request flow. The site still needs its secure backend project and invited tester access before real requests can be saved.</p><div class="dialog-highlight">${icon("lock")}<span>Until that setup is complete, this page only offers the clearly labeled sample demo. Do not enter real household details.</span></div><div class="dialog-actions"><button class="button button-primary" type="button" data-action="close-dialog">Close</button></div></div>`);
+    return;
+  }
+  pendingBetaEmail = "";
+  showBetaEmailForm();
+}
+
+function showBetaEmailForm() {
+  showDialog(`<div class="dialog-body"><p class="dialog-eyebrow">INVITED TESTER ACCESS</p><h2 class="dialog-title" id="dialog-title">Sign in to the private beta.</h2><p class="dialog-copy">Enter the email address that received your invitation. We’ll send you a one-time sign-in code.</p><form id="beta-email-form" class="form-grid"><div class="form-field"><label for="beta-email">Invited email</label><input id="beta-email" name="email" type="email" required autocomplete="email" maxlength="254" placeholder="you@example.com" value="${esc(pendingBetaEmail)}"></div><p class="field-help">Only invited testers can sign in. This does not create a public account.</p><p class="form-error" id="beta-auth-error" hidden></p><div class="dialog-actions"><button class="button button-outline" type="button" data-action="close-dialog">Cancel</button><button class="button button-primary" type="submit">Email me a code</button></div></form></div>`);
+  document.querySelector("#beta-email").focus();
+}
+
+function showBetaCodeForm(email) {
+  pendingBetaEmail = email;
+  showDialog(`<div class="dialog-body"><p class="dialog-eyebrow">CHECK YOUR EMAIL</p><h2 class="dialog-title" id="dialog-title">Enter your sign-in code.</h2><p class="dialog-copy">We sent a one-time code to <strong>${esc(email)}</strong>. It expires soon and can only be used once.</p><form id="beta-code-form" class="form-grid"><div class="form-field"><label for="beta-code">One-time code</label><input id="beta-code" name="code" required inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6,8}" minlength="6" maxlength="8" placeholder="6-digit code"></div><p class="form-error" id="beta-auth-error" hidden></p><div class="dialog-actions"><button class="button button-outline" type="button" data-action="beta-back-to-email">Change email</button><button class="button button-primary" type="submit">Verify and sign in</button></div></form></div>`);
+  document.querySelector("#beta-code").focus();
+}
+
+function signOutBetaTester() {
+  const token = betaSession?.access_token;
+  betaSession = null;
+  liveRequests = [];
+  liveRequestsLoaded = false;
+  liveRequestsLoading = false;
+  liveRequestsError = "";
+  pendingBetaEmail = "";
+  sessionStorage.removeItem("solohome-beta-session-v1");
+  updateBetaAuthButton();
+  render();
+  initializeBetaAuth().then(() => {
+    if (betaSession) render();
+  });
+  if (token && backendConfigured()) {
+    supabaseRequest("auth/v1/logout", { method: "POST", token })
+      .catch((error) => console.error("Could not invalidate the tester's server session.", error));
+  }
+
+  function showBetaAuthError(form, error) {
+    const message = form.querySelector("#beta-auth-error");
+    if (message) {
+      message.textContent = error.message || "The beta service could not complete the request.";
+      message.hidden = false;
+    }
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) {
+      submit.disabled = false;
+      submit.removeAttribute("aria-busy");
+    }
+  }
+  notify("You are signed out of the private beta.");
+}
 
 function saveState() {
   try {
@@ -124,7 +296,9 @@ function esc(value) {
 function currentCounts() {
   return {
     tasks: state.tasks.filter((task) => task.status !== "Complete").length,
-    requests: state.requests.filter((request) => request.status !== "Resolved").length,
+    requests: betaSession
+      ? liveRequests.filter((request) => request.status !== "Resolved").length
+      : state.requests.filter((request) => request.status !== "Resolved").length,
   };
 }
 
@@ -278,14 +452,23 @@ function renderHome() {
 
 function requestCard(request) {
   const statusClass = request.status === "Resolved" ? "status-done" : request.status === "New request" ? "status-open" : "status-attention";
-  return `<article class="request-card"><span class="request-icon">${icon(request.category === "Plumbing" ? "drop" : request.category === "Pool" ? "drop" : "home")}</span><div><h3>${esc(request.title)}</h3><p>${esc(request.category)} · ${esc(request.note)}</p><span class="request-date">${esc(request.date)} · Demo activity</span></div><div class="request-status"><span class="status-chip ${statusClass}">${esc(request.status)}</span><button class="button button-outline button-small" type="button" data-action="request-detail" data-id="${esc(request.id)}">Details</button></div></article>`;
+  return `<article class="request-card"><span class="request-icon">${icon(request.category === "Plumbing" ? "drop" : request.category === "Pool" ? "drop" : "home")}</span><div><h3>${esc(request.title)}</h3><p>${esc(request.category)} · ${esc(request.note)}</p><span class="request-date">${esc(request.date)} · ${request.isLive ? "Private tester request" : "Demo activity"}</span></div><div class="request-status"><span class="status-chip ${statusClass}">${esc(request.status)}</span><button class="button button-outline button-small" type="button" data-action="request-detail" data-id="${esc(request.id)}">Details</button></div></article>`;
 }
 
 function renderRequests() {
-  const requests = state.requests.filter((request) => state.requestFilter === "all" || (state.requestFilter === "open" ? request.status !== "Resolved" : request.status === "Resolved"));
-  return `${intro({ eyebrow: "FROM “SOMETHING FEELS OFF” TO “IT’S HANDLED”", title: "Requests, <em>with follow-through.</em>", subtitle: "Tell us what’s going on. A home manager helps figure out what comes next.", actions: `<button class="button button-primary" type="button" data-action="add-request">${icon("plus")} Start a request</button>` })}
-    <div class="service-footer">${icon("message")}<span><strong>Human-led, every step.</strong> Sending a request doesn’t book a vendor, share access, or authorize spending. Your home manager will follow up before any consequential action.</span></div>
-    <section class="page-section"><div class="page-section-header"><div><h2>Your household queue</h2><p>${state.requests.length} sample ${state.requests.length === 1 ? "request" : "requests"} · Fictional demo activity only</p></div><div class="request-filter" role="group" aria-label="Filter requests"><button class="filter-button${state.requestFilter === "all" ? " is-active" : ""}" type="button" data-action="filter-requests" data-filter="all">All</button><button class="filter-button${state.requestFilter === "open" ? " is-active" : ""}" type="button" data-action="filter-requests" data-filter="open">Open</button><button class="filter-button${state.requestFilter === "resolved" ? " is-active" : ""}" type="button" data-action="filter-requests" data-filter="resolved">Resolved</button></div></div><div class="request-list">${requests.length ? requests.map(requestCard).join("") : `<div class="overview-empty">Nothing in this view yet. Requests and updates will show here.</div>`}</div></section>
+  const source = betaSession ? liveRequests : state.requests;
+  const requests = source.filter((request) => state.requestFilter === "all" || (state.requestFilter === "open" ? request.status !== "Resolved" : request.status === "Resolved"));
+  const queueCount = betaSession ? `${liveRequests.length} private request${liveRequests.length === 1 ? "" : "s"} saved to your tester account` : `${state.requests.length} sample ${state.requests.length === 1 ? "request" : "requests"} · Fictional demo activity only`;
+  const queueMessage = betaSession
+    ? liveRequestsError
+      ? `Could not load your saved requests: ${esc(liveRequestsError)}. Try reloading this page.`
+      : !liveRequestsLoaded
+        ? "Loading your private tester requests…"
+        : "No private beta requests yet. Submit one to see it here."
+    : "Nothing in this view yet. Requests and updates will show here.";
+  return `${intro({ eyebrow: betaSession ? "PRIVATE INVITED TESTER BETA" : "FROM “SOMETHING FEELS OFF” TO “IT’S HANDLED”", title: "Requests, <em>with follow-through.</em>", subtitle: betaSession ? "Submit a real pilot request and see the private copy saved to your tester account." : "Try sample requests here, or sign in as an invited tester to submit a private beta request.", actions: `<button class="button button-primary" type="button" data-action="add-request">${icon("plus")} Start a request</button>` })}
+    <div class="service-footer">${icon("message")}<span><strong>${betaSession ? "Private beta request." : "Human-led, every step."}</strong> ${betaSession ? "Your request is stored privately with your invited tester account. No vendor is contacted or work booked. The pilot team will need to review the beta queue." : "The sample demo stays in this browser. To submit a real private pilot request, sign in using the invited tester access."}</span></div>
+    <section class="page-section"><div class="page-section-header"><div><h2>${betaSession ? "Your private beta requests" : "Sample household queue"}</h2><p>${queueCount}</p></div><div class="request-filter" role="group" aria-label="Filter requests"><button class="filter-button${state.requestFilter === "all" ? " is-active" : ""}" type="button" data-action="filter-requests" data-filter="all">All</button><button class="filter-button${state.requestFilter === "open" ? " is-active" : ""}" type="button" data-action="filter-requests" data-filter="open">Open</button><button class="filter-button${state.requestFilter === "resolved" ? " is-active" : ""}" type="button" data-action="filter-requests" data-filter="resolved">Resolved</button></div></div><div class="request-list">${requests.length ? requests.map(requestCard).join("") : `<div class="overview-empty">${queueMessage}</div>`}</div></section>
     <section class="page-section"><div class="page-section-header"><div><h2>What happens after you ask?</h2><p>Clear steps, with your approval at the right moments.</p></div></div><article class="panel"><div class="detail-list"><div class="detail-row"><strong>1. We listen</strong><span>Jordan checks in and clarifies what you need.</span></div><div class="detail-row"><strong>2. We coordinate</strong><span>We research options and bring the details back to you.</span></div><div class="detail-row"><strong>3. You decide</strong><span>You approve the vendor, price and appointment before anything is booked.</span></div></div></article></section>`;
 }
 
@@ -410,7 +593,9 @@ const pageRenderers = { today: renderToday, home: renderHome, care: renderCare, 
 function render() {
   updateBadges();
   updateNav();
+  updateBetaAuthButton();
   pageView.innerHTML = pageRenderers[state.page]();
+  if (state.page === "requests" && betaSession && !liveRequestsLoaded) loadLiveRequests();
   if (state.page === "records") {
     document.querySelector("#record-filter").addEventListener("change", (event) => {
       const value = event.target.value;
@@ -446,8 +631,9 @@ function showEstimateDialog() {
 }
 
 function showRequestForm(prefill = "") {
-  showDialog(`<div class="dialog-body"><p class="dialog-eyebrow">A REAL PERSON WILL FOLLOW UP</p><h2 class="dialog-title" id="dialog-title">What’s going on at home?</h2><p class="dialog-copy">Share the first thing that comes to mind. Your home manager will help figure out what to do next.</p>
-    <form id="request-form" class="form-grid"><div class="form-field"><label for="request-title">What needs attention?</label><input id="request-title" name="title" required maxlength="90" placeholder="e.g. The guest bath faucet is dripping" value="${esc(prefill)}"></div><div class="form-field"><label for="request-category">What is it about?</label><select id="request-category" name="category"><option>Home repair</option><option>HVAC</option><option>Plumbing</option><option>Roofing</option><option>Pool</option><option>Pest</option><option>Landscaping</option><option>Something else</option></select></div><div class="form-field"><label for="request-note">A little more context <span style="font-weight:400;color:#9ba398;">(optional)</span></label><textarea id="request-note" name="note" maxlength="420" placeholder="When did you notice it? Anything that would help us understand?"></textarea><p class="field-help">Please don’t include passwords, door codes or sensitive personal information.</p></div><p class="form-error" id="request-error" hidden></p><div class="form-actions"><span>Sending a request does not authorize work or spending.</span><button class="button button-primary" type="submit">Send to Jordan ${icon("arrow")}</button></div></form></div>`);
+  const live = Boolean(betaSession);
+  showDialog(`<div class="dialog-body"><p class="dialog-eyebrow">${live ? "PRIVATE INVITED-TESTER REQUEST" : "SAMPLE DEMO REQUEST"}</p><h2 class="dialog-title" id="dialog-title">What’s going on at home?</h2><p class="dialog-copy">${live ? "This request will be securely saved to your invited tester account. The pilot team will need to review it; no vendor is contacted or work booked." : "This is a sample request saved only in this browser. Sign in with an invited tester account to submit a private beta request."}</p>
+    <form id="request-form" class="form-grid" data-live="${live}"><div class="form-field"><label for="request-title">What needs attention?</label><input id="request-title" name="title" required maxlength="90" placeholder="e.g. The guest bath faucet is dripping" value="${esc(prefill)}"></div><div class="form-field"><label for="request-category">What is it about?</label><select id="request-category" name="category"><option>Home repair</option><option>HVAC</option><option>Plumbing</option><option>Roofing</option><option>Pool</option><option>Pest</option><option>Landscaping</option><option>Something else</option></select></div><div class="form-field"><label for="request-note">A little more context <span style="font-weight:400;color:#9ba398;">(optional)</span></label><textarea id="request-note" name="note" maxlength="420" placeholder="When did you notice it? Anything that would help us understand?"></textarea><p class="field-help">Do not enter your street address, passwords, door codes, account numbers or sensitive personal information.</p></div><p class="form-error" id="request-error" hidden></p><div class="form-actions"><span>${live ? "Private to your tester account · No action will be booked." : "Local sample only · Not sent to a real person."}</span><button class="button button-primary" type="submit">${live ? "Submit private request" : "Add sample request"} ${icon("arrow")}</button></div></form></div>`);
   document.querySelector("#request-title").focus();
 }
 
@@ -551,7 +737,8 @@ function showAssetDetail(asset) {
 
 function showRequestDetail(request) {
   if (!request) return;
-  showDialog(`<div class="dialog-body"><p class="dialog-eyebrow">HOUSEHOLD REQUEST · ${esc(request.category.toUpperCase())}</p><h2 class="dialog-title" id="dialog-title">${esc(request.title)}</h2><p class="dialog-copy">${esc(request.date)} · ${esc(request.status)} · Illustrative sample activity</p><div class="detail-value">${esc(request.note)}</div><div class="dialog-highlight">${icon("message")}<span>Home manager <strong>${esc(request.manager || "Jordan Lee")}</strong> is the human point of contact in this example. No real follow-up is happening in the prototype.</span></div><div class="dialog-actions"><button class="button button-outline" type="button" data-action="close-dialog">Close</button>${request.status !== "Resolved" ? `<button class="button button-primary" type="button" data-action="resolve-request" data-id="${esc(request.id)}">Mark resolved in demo ${icon("check")}</button>` : ""}</div></div>`);
+  const isLive = Boolean(request.isLive);
+  showDialog(`<div class="dialog-body"><p class="dialog-eyebrow">${isLive ? "PRIVATE BETA REQUEST" : "SAMPLE HOUSEHOLD REQUEST"} · ${esc(request.category.toUpperCase())}</p><h2 class="dialog-title" id="dialog-title">${esc(request.title)}</h2><p class="dialog-copy">${esc(request.date)} · ${esc(request.status)}${isLive ? "" : " · Illustrative sample activity"}</p><div class="detail-value">${esc(request.note)}</div><div class="dialog-highlight">${icon(isLive ? "lock" : "message")}<span>${isLive ? "Saved privately to your invited tester account. The pilot team must review requests through the secure project console; no response or turnaround time is promised." : "This is a sample household manager profile. No real follow-up is happening in the prototype."}</span></div><div class="dialog-actions"><button class="button button-outline" type="button" data-action="close-dialog">Close</button>${!isLive && request.status !== "Resolved" ? `<button class="button button-primary" type="button" data-action="resolve-request" data-id="${esc(request.id)}">Mark resolved in demo ${icon("check")}</button>` : ""}</div></div>`);
 }
 
 function showRecordDetail(record) {
@@ -582,6 +769,9 @@ document.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action]");
   if (!button) return;
   const action = button.dataset.action;
+  if (action === "beta-auth") showBetaSignIn();
+  if (action === "beta-sign-out") signOutBetaTester();
+  if (action === "beta-back-to-email") showBetaEmailForm();
   if (action === "review-estimate") showEstimateDialog();
   if (action === "add-request") showRequestForm();
   if (action === "add-record") showRecordForm();
@@ -712,8 +902,56 @@ document.addEventListener("click", (event) => {
   if (action === "household-switch") notify("This prototype includes one illustrative household.");
 });
 
-document.addEventListener("submit", (event) => {
+document.addEventListener("submit", async (event) => {
   const form = event.target;
+  if (form.id === "beta-email-form") {
+    event.preventDefault();
+    const email = getFormValue(new FormData(form), "email").toLowerCase();
+    const submit = form.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    submit.setAttribute("aria-busy", "true");
+    submit.textContent = "Sending code…";
+    try {
+      await supabaseRequest("auth/v1/otp", {
+        method: "POST",
+        body: { email, create_user: false },
+      });
+      showBetaCodeForm(email);
+      notify("If that email is invited, a one-time code is on its way.");
+    } catch (error) {
+      console.error("Could not send an invited tester sign-in code.", error);
+      showBetaAuthError(form, error);
+    }
+    return;
+  }
+  if (form.id === "beta-code-form") {
+    event.preventDefault();
+    const code = getFormValue(new FormData(form), "code");
+    const submit = form.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    submit.setAttribute("aria-busy", "true");
+    submit.textContent = "Verifying…";
+    try {
+      const session = await supabaseRequest("auth/v1/verify", {
+        method: "POST",
+        body: { email: pendingBetaEmail, token: code, type: "email" },
+      });
+      saveBetaSession(session);
+      betaSession.user = session.user || await supabaseRequest("auth/v1/user", { token: betaSession.access_token });
+      sessionStorage.setItem("solohome-beta-session-v1", JSON.stringify(betaSession));
+      liveRequests = [];
+      liveRequestsLoaded = false;
+      liveRequestsError = "";
+      state.requestFilter = "all";
+      closeDialog();
+      switchPage("requests");
+      notify("You are signed in to the private tester beta.");
+    } catch (error) {
+      console.error("Could not verify the invited tester sign-in code.", error);
+      showBetaAuthError(form, error);
+    }
+    return;
+  }
   if (form.id === "beta-feedback-form") {
     event.preventDefault();
     const values = new FormData(form);
@@ -777,6 +1015,54 @@ document.addEventListener("submit", (event) => {
     const values = new FormData(form);
     const title = getFormValue(values, "title");
     if (!title) return;
+    if (form.dataset.live === "true") {
+      const errorMessage = form.querySelector("#request-error");
+      const submit = form.querySelector('button[type="submit"]');
+      if (!betaSession || !backendConfigured()) {
+        errorMessage.textContent = "Your tester session is no longer active. Sign in again before submitting; this request has not been saved.";
+        errorMessage.hidden = false;
+        return;
+      }
+      submit.disabled = true;
+      submit.setAttribute("aria-busy", "true");
+      submit.textContent = "Saving privately…";
+      try {
+        const rows = await supabaseRequest("rest/v1/beta_requests", {
+          method: "POST",
+          token: await getBetaAccessToken(),
+          body: {
+            title: title.slice(0, 90),
+            category: getFormValue(values, "category") || "Something else",
+            note: getFormValue(values, "note").slice(0, 420),
+          },
+        });
+        const row = rows?.[0];
+        if (row) {
+          liveRequests.unshift({
+            ...row,
+            isLive: true,
+            date: new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" }).format(new Date(row.created_at)),
+            manager: "Pilot team",
+          });
+          liveRequestsLoaded = true;
+        } else {
+          liveRequestsLoaded = false;
+        }
+        liveRequestsError = "";
+        state.requestFilter = "all";
+        closeDialog();
+        switchPage("requests");
+        notify("Your private beta request was saved. The pilot team must review it; no work was booked.");
+      } catch (error) {
+        console.error("Could not save the private beta request.", error);
+        errorMessage.textContent = `Your request was not saved: ${error.message}. Please try again.`;
+        errorMessage.hidden = false;
+        submit.disabled = false;
+        submit.removeAttribute("aria-busy");
+        submit.innerHTML = `Submit private request ${icon("arrow")}`;
+      }
+      return;
+    }
     state.requests.unshift({
       id: `req-${Date.now()}`,
       title,

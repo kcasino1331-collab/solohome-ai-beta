@@ -1,9 +1,10 @@
-const CACHE_NAME = "solohome-beta-shell-v3";
+const CACHE_NAME = "solohome-beta-shell-v4";
 const APP_FILES = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./backend-config.js",
   "./manifest.webmanifest",
   "./icon-192.png",
   "./icon-512.png",

@@ -1,17 +1,29 @@
 # SOLOhome AI beta model
 
-A responsive, installable local-first beta model for testing the proposed Tampa Bay household-operations experience. It demonstrates home records and maintenance planning alongside human-led coordination, with homeowner approval at each consequential step.
+A responsive, installable preview of the proposed Tampa Bay household-operations experience. The sample household, maintenance schedule, bills, records, prices, vendors, devices and home-manager profile are fictional. Interactive demo changes stay in the tester's browser.
 
-## Run it
+## Try the hosted demo
 
-No build step or package installation is required. Open the hosted beta model at `https://kcasino1331-collab.github.io/solohome-ai-beta/` in a current desktop or mobile browser. To run it locally, open `index.html` or use `python -m http.server 8000` and visit `http://localhost:8000`.
+Open [the SOLOhome AI beta model](https://kcasino1331-collab.github.io/solohome-ai-beta/) on desktop or mobile. The Today page includes a short walkthrough. Use **Beta feedback** to save a response locally and download a JSON report; sharing it is up to the tester. The report is not automatically sent to the product team.
 
-On the Today dashboard, the optional two-minute walkthrough points to the estimate approval, service finder and household request flows. Use **Beta feedback** to save a rating and comment in this browser, then download a JSON report if you choose to share it. Nothing is transmitted automatically. On a hosted HTTPS site (or localhost), the app can be installed from the browser and its app shell is cached for offline use after the first visit.
+To run locally, open `index.html` or serve this folder over localhost (for example, `python -m http.server 8000`). There is no build step or package installation. On HTTPS or localhost, the browser can install the app and cache its shell for offline browsing after the first visit.
 
-## Beta scope and privacy
+## Private tester beta setup
 
-Demo actions, feedback and illustrative household details are stored in browser `localStorage` under `household-os-demo-v1`. Clear this site's local storage to reset the beta model. If browser storage is unavailable, the app remains usable for the visit and shows a notice that changes may not persist.
+The optional invited-tester request feature uses Supabase Auth and a private Postgres table. It is **not active on the hosted demo until an owner configures a Supabase project**. With the empty values in `backend-config.js`, the app deliberately stays in demo-only mode.
 
-This is a beta model of the product experience, not a production service. The Bennett household, home records, activity, bills, amounts, providers, camera previews, device states and home-manager profile are sample data. All edits stay in each tester's browser. No sign-in, shared cloud database, live account, payment, real notification, device control, vendor search or vendor contact is connected. The service finder uses fixed fictional examples; requests and approvals are local simulations only. Feedback reports contain the tester's rating, topic, comment and timestamp and must be downloaded and shared by the tester. The public website serves the app files; it does not transmit user-entered demo data to the hosting provider.
+An owner who already has a Supabase project can enable the private pilot:
 
-Membership tiers at $99 Essential, $249 Complete and $499+ White Glove per month are proposed pricing for discussion, not validated pricing, customer traction or market evidence. Before inviting external customers, host over HTTPS, replace fictional examples with verified content, decide how feedback will be securely collected, and complete the necessary privacy, security and operational reviews. This model does not represent live customers, partnerships or integrations.
+1. In Supabase, create a project and configure its Auth email provider and allowed redirect/site URLs for the hosted Pages domain and any local test origin.
+2. In the Supabase SQL editor, run `supabase-schema.sql`. It creates `public.beta_requests`, enables row-level security, allows each authenticated tester to read and submit only their own requests, and disallows tester updates/deletes.
+3. Invite each tester's exact email address in Supabase Auth. The app requests a one-time code with account creation disabled, so arbitrary visitors cannot sign up.
+4. Copy the project URL and the project's **publishable (anon) key** into `backend-config.js`. Never put a service-role key or other secret in this file or the public repository.
+5. Publish the updated static files and test an invited account end-to-end before sharing the private beta sign-in.
+
+After sign-in, testers can submit a short private household request and see only their own saved requests. Requests are not routed to staff automatically: the pilot team must review them in the Supabase dashboard. No vendor is contacted, work scheduled, payment taken, or service response promised. Sign-out clears the local browser session and attempts to invalidate the server session.
+
+**Do not collect sensitive household information.** The request form asks testers not to enter an address, door code, password, account number or other sensitive personal data. The authenticated email and submitted request fields are stored by the configured Supabase project. Configure its access, retention and deletion practices appropriately before inviting anyone.
+
+## What remains a simulation
+
+All other app areas remain illustrative local demos. There is no live AI, smart-device connection, utility/biller integration, vendor search, payment, booking, service delivery or automatic feedback collection. Membership prices are proposed discussion assumptions, not validated offers or traction. The private request queue is a narrow pilot feature, not a production home-management service.
